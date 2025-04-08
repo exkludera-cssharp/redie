@@ -5,49 +5,53 @@ using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Core.Translations;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using CounterStrikeSharp.API.Modules.Entities.Constants;
-using System.Runtime.InteropServices;
+using CounterStrikeSharp.API.Modules.UserMessages;
 using System.Drawing;
 
 public class Plugin : BasePlugin, IPluginConfig<Config>
 {
     public override string ModuleName => "Redie";
-    public override string ModuleVersion => "1.0.1";
+    public override string ModuleVersion => "1.0.2";
     public override string ModuleAuthor => "exkludera";
 
-    HashSet<int> RediePlayers = new HashSet<int>();
+    public HashSet<CCSPlayerController> RediePlayers = new();
 
     public override void Load(bool hotReload)
     {
-        RegisterEventHandler<EventPlayerSpawn>(EventPlayerSpawn);
-        RegisterEventHandler<EventRoundStart>(EventRoundStart);
-        RegisterEventHandler<EventPlayerTeam>(EventPlayerTeam);
-
-        HookEntityOutput("trigger_teleport", "OnStartTouch", Disrupting, HookMode.Pre);
-        HookEntityOutput("trigger_hurt", "OnHurtPlayer", Disrupting, HookMode.Pre);
-        HookEntityOutput("func_door", "OnBlockedClosing", Disrupting, HookMode.Pre);
-        HookEntityOutput("func_door", "OnBlockedOpening", Disrupting, HookMode.Pre);
-
-        foreach (var cmd in Config.Commands.Split(','))
+        foreach (var cmd in Config.Commands)
             AddCommand(cmd, "Redie Command", (player, command) => Command_Redie(player));
 
-        VirtualFunctions.CCSPlayer_WeaponServices_CanUseFunc.Hook(OnCanUse, HookMode.Pre);
+        RegisterEventHandler<EventRoundStart>(EventRoundStart, HookMode.Pre);
+        RegisterEventHandler<EventPlayerTeam>(EventPlayerTeam);
+        RegisterEventHandler<EventPlayerDeath>(EventPlayerDeath, HookMode.Pre);
+
+        RegisterListener<Listeners.CheckTransmit>(CheckTransmit);
+
+        HookUserMessage(208, CMsgSosStartSoundEvent, HookMode.Pre);
+
+        HookEntityOutput("*", "*", Disrupting, HookMode.Pre);
+
+        VirtualFunctions.CCSPlayer_ItemServices_CanAcquireFunc.Hook(CanAcquireFunc, HookMode.Pre);
+        VirtualFunctions.CBaseEntity_TakeDamageOldFunc.Hook(TakeDamageOldFunc, HookMode.Pre);
     }
 
     public override void Unload(bool hotReload)
     {
-        DeregisterEventHandler<EventPlayerSpawn>(EventPlayerSpawn);
-        DeregisterEventHandler<EventRoundStart>(EventRoundStart);
-        DeregisterEventHandler<EventPlayerTeam>(EventPlayerTeam);
-
-        UnhookEntityOutput("trigger_teleport", "OnStartTouch", Disrupting, HookMode.Pre);
-        UnhookEntityOutput("trigger_hurt", "OnHurtPlayer", Disrupting, HookMode.Pre);
-        UnhookEntityOutput("func_door", "OnBlockedClosing", Disrupting, HookMode.Pre);
-        UnhookEntityOutput("func_door", "OnBlockedOpening", Disrupting, HookMode.Pre);
-
-        foreach (var cmd in Config.Commands.Split(','))
+        foreach (var cmd in Config.Commands)
             RemoveCommand(cmd, (player, command) => Command_Redie(player));
 
-        VirtualFunctions.CCSPlayer_WeaponServices_CanUseFunc.Unhook(OnCanUse, HookMode.Pre);
+        DeregisterEventHandler<EventRoundStart>(EventRoundStart, HookMode.Pre);
+        DeregisterEventHandler<EventPlayerTeam>(EventPlayerTeam);
+        DeregisterEventHandler<EventPlayerDeath>(EventPlayerDeath, HookMode.Pre);
+
+        RemoveListener<Listeners.CheckTransmit>(CheckTransmit);
+
+        UnhookUserMessage(208, CMsgSosStartSoundEvent, HookMode.Pre);
+
+        UnhookEntityOutput("*", "*", Disrupting, HookMode.Pre);
+
+        VirtualFunctions.CCSPlayer_ItemServices_CanAcquireFunc.Unhook(CanAcquireFunc, HookMode.Pre);
+        VirtualFunctions.CBaseEntity_TakeDamageOldFunc.Unhook(TakeDamageOldFunc, HookMode.Pre);
     }
 
     public Config Config { get; set; } = new Config();
@@ -57,74 +61,58 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
         Config.Prefix = StringExtensions.ReplaceColorTags(config.Prefix);
     }
 
-    public void Command_Redie(CCSPlayerController? player)
+    void Command_Redie(CCSPlayerController? player)
     {
-        if (player == null || !player.IsValid || player.PawnIsAlive || player.Team == CsTeam.Spectator || player.Team == CsTeam.None)
+        if (player == null || player.PawnIsAlive || player.Team == CsTeam.Spectator || player.Team == CsTeam.None)
             return;
 
-        var playerPawn = player.PlayerPawn.Value!;
+        if (!RediePlayers.Contains(player))
+            Redie(player);
 
-        if (!RediePlayers.Contains(player.Slot))
+        else UnRedie(player);
+    }
+
+    void Redie(CCSPlayerController player)
+    {
+        var playerPawn = player.PlayerPawn.Value;
+        if (playerPawn == null) return;
+
+        player.Respawn();
+        player.RemoveWeapons();
+
+        RediePlayers.Add(player);
+
+        Server.NextFrame(() =>
         {
-            RediePlayers.Add(player.Slot);
+            playerPawn.Collision.CollisionAttribute.CollisionGroup = (byte)CollisionGroup.COLLISION_GROUP_DISSOLVING; //noblock
+            playerPawn.Collision.CollisionGroup = (byte)CollisionGroup.COLLISION_GROUP_DISSOLVING; //noblock
+            playerPawn.ShadowStrength = 0f;
+            playerPawn.Render = Color.Transparent; //for ragdoll if player unredie
 
-            player.Respawn();
-            player.RemoveWeapons();
-
-            HidePlayer(player, true);
-
-            playerPawn.Collision.CollisionAttribute.CollisionGroup = (byte)CollisionGroup.COLLISION_GROUP_DISSOLVING; //noblock fix
-            playerPawn.Collision.CollisionGroup = (byte)CollisionGroup.COLLISION_GROUP_DISSOLVING; //noblock fix
- 
-            //fix for custom player models
-            AddTimer(0.0f, () => {
-
-                player.RemoveWeapons();
-                HidePlayer(player, true);
-
-                AddTimer(0.0f, () => { playerPawn.LifeState = (byte)LifeState_t.LIFE_DYING; });
+            //timer to avoid blackscreen
+            AddTimer(0.25f, () =>
+            {
+                playerPawn.LifeState = (byte)LifeState_t.LIFE_DYING;
             });
+        });
 
-            if (Config.Messages)
-                player.PrintToChat($"{Config.Prefix} {Config.Message_Redie}");
-        }
+        if (Config.Messages)
+            player.PrintToChat($"{Config.Prefix} {Config.Message_Redie}");
+    }
 
-        else if (RediePlayers.Contains(player.Slot))
+    void UnRedie(CCSPlayerController player)
+    {
+        var playerPawn = player.PlayerPawn.Value;
+        if (playerPawn == null) return;
+
+        Server.NextFrame(() =>
         {
-            RediePlayers.Remove(player.Slot);
-            player.PlayerPawn.Value!.LifeState = (byte)LifeState_t.LIFE_ALIVE;
+            playerPawn.LifeState = (byte)LifeState_t.LIFE_ALIVE;
             player.CommitSuicide(false, true);
 
             if (Config.Messages)
                 player.PrintToChat($"{Config.Prefix} {Config.Message_UnRedie}");
-        }
-    }
-
-
-    private static readonly MemoryFunctionWithReturn<nint, string, int, int> SetBodygroupFunc = new(RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "55 48 89 E5 41 56 49 89 F6 41 55 41 89 D5 41 54 49 89 FC 48 83 EC 08" : "40 53 41 56 41 57 48 81 EC 90 00 00 00 0F 29 74 24 70");
-    private static readonly Func<nint, string, int, int> SetBodygroup = SetBodygroupFunc.Invoke;
-    public void HidePlayer(CCSPlayerController player, bool status)
-    {
-        var pawn = player.PlayerPawn.Value;
-
-        pawn!.Render = status ? Color.FromArgb(0, 0, 0, 0) : Color.FromArgb(255, 255, 255, 255);
-        Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_clrRender");
-
-        var gloves = pawn.EconGloves;
-        SetBodygroup(pawn.Handle, "default_gloves", status ? 0 : 1);
-    }
-
-    HookResult EventPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
-    {
-        var player = @event.Userid;
-
-        if (player == null || !player.IsValid)
-            return HookResult.Continue;
-
-        if (RediePlayers.Contains(player.Slot))
-            HidePlayer(player, false);
-
-        return HookResult.Continue;
+        });
     }
 
     HookResult EventRoundStart(EventRoundStart @event, GameEventInfo info)
@@ -141,22 +129,99 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
         if (player == null || !player.IsValid)
             return HookResult.Continue;
 
-        if (RediePlayers.Contains(player.Slot))
+        if (RediePlayers.Contains(player))
+            RediePlayers.Remove(player);
+
+        return HookResult.Continue;
+    }
+
+    HookResult EventPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+
+        if (player == null || !player.IsValid)
+            return HookResult.Continue;
+
+        if (RediePlayers.Contains(player))
         {
-            HidePlayer(player, false);
-            RediePlayers.Remove(player.Slot);
+            info.DontBroadcast = true;
+            RediePlayers.Remove(player);
         }
 
         return HookResult.Continue;
     }
 
-    HookResult OnCanUse(DynamicHook hook)
+    void CheckTransmit(CCheckTransmitInfoList infoList)
     {
-        var weaponservices = hook.GetParam<CCSPlayer_WeaponServices>(0);
+        foreach ((CCheckTransmitInfo info, CCSPlayerController? player) in infoList)
+        {
+            if (player == null) continue;
 
-        var player = new CCSPlayerController(weaponservices.Pawn.Value.Controller.Value!.Handle);
+            foreach (var hidden in RediePlayers)
+            {
+                if (player == hidden || player.Pawn.Value?.As<CCSPlayerPawnBase>().PlayerState == CSPlayerState.STATE_OBSERVER_MODE)
+                    continue;
 
-        if (RediePlayers.Contains(player.Slot))
+                var remove = hidden.Pawn.Value;
+                if (remove == null) continue;
+
+                info.TransmitEntities.Remove(remove);
+            }
+        }
+    }
+
+    HookResult CMsgSosStartSoundEvent(UserMessage um)
+    {
+        int entIndex = um.ReadInt("source_entity_index");
+        var entHandle = NativeAPI.GetEntityFromIndex(entIndex);
+
+        var pawn = new CBasePlayerPawn(entHandle);
+        if (pawn == null || !pawn.IsValid || pawn.DesignerName != "player")
+            return HookResult.Continue;
+
+        var player = pawn.Controller?.Value?.As<CCSPlayerController>();
+        if (player == null || !player.IsValid)
+            return HookResult.Continue;
+
+        if (RediePlayers.Contains(player))
+        {
+            foreach (var target in Utilities.GetPlayers())
+            {
+                if (target.IsBot) continue;
+                if (target == player) continue;
+
+                um.Recipients.Remove(target);
+            }
+        }
+
+        return HookResult.Continue;
+    }
+
+    HookResult Disrupting(CEntityIOOutput output, string name, CEntityInstance activator, CEntityInstance caller, CVariant value, float delay)
+    {
+        if (activator.DesignerName != "player")
+            return HookResult.Continue;
+
+        var pawn = activator.As<CCSPlayerPawn>();
+        if (pawn == null || !pawn.IsValid)
+            return HookResult.Continue;
+
+        var player = pawn.OriginalController?.Value?.As<CCSPlayerController>();
+        if (player == null || player.IsBot)
+            return HookResult.Continue;
+
+        if (RediePlayers.Contains(player))
+            return HookResult.Handled;
+
+        return HookResult.Continue;
+    }
+
+    HookResult CanAcquireFunc(DynamicHook hook)
+    {
+        var player = hook.GetParam<CCSPlayer_ItemServices>(0).Pawn.Value.Controller.Value?.As<CCSPlayerController>();
+        if (player == null) return HookResult.Continue;
+
+        if (RediePlayers.Contains(player))
         {
             hook.SetReturn(false);
             return HookResult.Handled;
@@ -165,32 +230,29 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
         return HookResult.Continue;
     }
 
-    HookResult Disrupting(CEntityIOOutput output, string name, CEntityInstance activator, CEntityInstance caller, CVariant value, float delay)
+    HookResult TakeDamageOldFunc(DynamicHook hook)
     {
-        if (Config.SlayOnDisrupting)
+        var pawn = hook.GetParam<CCSPlayerPawn>(0);
+        var info = hook.GetParam<CTakeDamageInfo>(1);
+
+        if (pawn == null || info == null)
+            return HookResult.Continue;
+
+        var player = pawn.OriginalController?.Value?.As<CCSPlayerController>();
+        if (player == null || player.IsBot) return HookResult.Continue;
+
+        if (RediePlayers.Contains(player))
         {
-            if (activator == null || caller == null)
+            if (info.DamageFlags.HasFlag(TakeDamageFlags_t.DFLAG_FORCE_DEATH))
                 return HookResult.Continue;
 
-            if (activator.DesignerName != "player")
-                return HookResult.Continue;
-
-            var player = new CCSPlayerController(new CCSPlayerPawn(activator.Handle).Controller.Value!.Handle);
-
-            if (player == null)
-                return HookResult.Continue;
-
-            if (RediePlayers.Contains(player.Slot))
+            if ((pawn.DesignerName == "player" && info.Attacker.Value?.DesignerName == "player") || info.BitsDamageType == DamageTypes_t.DMG_FALL)
             {
-                RediePlayers.Remove(player.Slot);
-                player.PlayerPawn.Value!.LifeState = (byte)LifeState_t.LIFE_ALIVE;
-                player.CommitSuicide(false, true);
-
-                if (Config.Messages)
-                    player.PrintToChat($"{Config.Prefix} {Config.Message_UnRedieDisrupting}");
-
+                hook.SetReturn(false);
                 return HookResult.Handled;
             }
+ 
+            UnRedie(player);
         }
 
         return HookResult.Continue;
