@@ -109,9 +109,6 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
         {
             playerPawn.LifeState = (byte)LifeState_t.LIFE_ALIVE;
             player.CommitSuicide(false, true);
-
-            if (Config.Messages)
-                player.PrintToChat($"{Config.Prefix} {Config.Message_UnRedie}");
         });
     }
 
@@ -146,6 +143,9 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
         {
             info.DontBroadcast = true;
             RediePlayers.Remove(player);
+
+            if (Config.Messages)
+                player.PrintToChat($"{Config.Prefix} {Config.Message_UnRedie}");
         }
 
         return HookResult.Continue;
@@ -211,7 +211,10 @@ public class Plugin : BasePlugin, IPluginConfig<Config>
             return HookResult.Continue;
 
         if (RediePlayers.Contains(player))
+        {
+            UnRedie(player);
             return HookResult.Handled;
+        }
 
         return HookResult.Continue;
     }
